@@ -25,6 +25,9 @@ DEFAULT_TAGS = [
     "prioridad D",
     "casa",
     "trabajo",
+    "mañana",
+    "tarde",
+    "noche",
 ]
 
 # ---------------------------- DB Helpers ---------------------------- #
@@ -258,10 +261,6 @@ def find_next_action_by_tags(selected_tag_ids):
     return row
 
 def find_actions_by_tags(selected_tag_ids, include_completed=False):
-    """
-    Devuelve TODAS las acciones que cumplen TODAS las etiquetas seleccionadas,
-    en orden de creación ascendente. Por defecto solo pendientes.
-    """
     conn = get_conn()
     cur = conn.cursor()
     status_clause = "" if include_completed else "AND a.is_complete = 0"
@@ -313,7 +312,6 @@ class TagManager(tk.Toplevel):
         self.on_close = on_close
         self.configure(padx=10, pady=10)
 
-        # Search box
         ttk.Label(self, text="Buscar etiqueta:").grid(row=0, column=0, sticky="w")
         self.search_var = tk.StringVar()
         self.search_entry = ttk.Entry(self, textvariable=self.search_var)
@@ -321,7 +319,6 @@ class TagManager(tk.Toplevel):
         self.grid_columnconfigure(1, weight=1)
         self.search_var.trace_add("write", lambda *args: self._apply_filter())
 
-        # Tag list
         self.tag_list = tk.Listbox(self, height=12)
         self.tag_list.grid(row=1, column=0, columnspan=3, sticky="nsew", pady=(6,10))
         self.grid_rowconfigure(1, weight=1)
@@ -421,7 +418,6 @@ class ActionEditor(tk.Toplevel):
         self.desc_entry.grid(row=0, column=1, columnspan=3, sticky="ew")
         self.grid_columnconfigure(1, weight=1)
 
-        # Search + results for available tags
         ttk.Label(self, text="Buscar etiqueta:").grid(row=1, column=0, sticky="w", pady=(10,0))
         self.search_var = tk.StringVar()
         self.search_entry = ttk.Entry(self, textvariable=self.search_var)
@@ -444,7 +440,6 @@ class ActionEditor(tk.Toplevel):
 
         ttk.Button(self, text="Añadir seleccionada", command=self.add_selected_from_results).grid(row=4, column=0, sticky="w", pady=(6,0))
 
-        # Selected tags list
         ttk.Label(self, text="Etiquetas de la acción:").grid(row=5, column=0, sticky="w", pady=(10,0))
         self.selected_tags_list = tk.Listbox(self, height=8, selectmode=tk.SINGLE)
         self.selected_tags_list.grid(row=6, column=0, columnspan=2, sticky="nsew")
@@ -626,15 +621,14 @@ class MatchingActionsDialog(tk.Toplevel):
         if not aid:
             messagebox.showinfo("Info", "Selecciona una acción en la lista.")
             return
-        self.mark_done_cb(aid)  # actualiza en DB y en vista principal
-        self._load_results()    # refresca lista (la acción marcada desaparece)
+        self.mark_done_cb(aid)
+        self._load_results()
 
     def _goto_selected(self):
         aid = self._get_selected_action_id()
         if not aid:
             messagebox.showinfo("Info", "Selecciona una acción en la lista.")
             return
-        # Para obtener el project_id: consulta rápida
         conn = get_conn()
         cur = conn.cursor()
         cur.execute("SELECT project_id FROM actions WHERE id=?", (aid,))
@@ -664,6 +658,17 @@ class App(tk.Tk):
         main.add(left, weight=1)
 
         ttk.Label(left, text="Proyectos").pack(anchor="w")
+
+        # --- Project search ---
+        search_row = ttk.Frame(left)
+        search_row.pack(fill=tk.X, pady=(2,4))
+        self.project_search_var = tk.StringVar()
+        self.project_search_entry = ttk.Entry(search_row, textvariable=self.project_search_var)
+        self.project_search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        clear_btn = ttk.Button(search_row, text="Limpiar", width=8, command=lambda: self.project_search_var.set(""))
+        clear_btn.pack(side=tk.LEFT, padx=(6,0))
+        self.project_search_var.trace_add("write", lambda *args: self._apply_project_filter())
+
         self.projects_list = tk.Listbox(left, height=12, exportselection=False)
         self.projects_list.pack(fill=tk.BOTH, expand=True, pady=(4,6))
         self.projects_list.bind("<<ListboxSelect>>", self._on_project_selected)
@@ -719,6 +724,67 @@ class App(tk.Tk):
         ttk.Button(right, text="Siguiente acción", command=self._show_next_action).pack(fill=tk.X, pady=(6,4))
         ttk.Button(right, text="Ver acciones coincidentes", command=self._show_matching_actions).pack(fill=tk.X, pady=(0,4))
         ttk.Button(right, text="Gestionar etiquetas…", command=self._open_tag_manager).pack(fill=tk.X)
+
+    # -------- Projects filtering -------- #
+    def _apply_project_filter(self):
+        term = (self.project_search_var.get() or "").strip().lower()
+        current = self._get_selected_project()
+        current_id = current["id"] if current else None
+
+        if term:
+            self._filtered_projects = [p for p in self._projects_cache if term in p["name"].lower()]
+        else:
+            self._filtered_projects = list(self._projects_cache)
+
+        self.projects_list.delete(0, tk.END)
+        for p in self._filtered_projects:
+            self.projects_list.insert(tk.END, p["name"])
+
+        target_index = None
+        if current_id is not None:
+            for i, p in enumerate(self._filtered_projects):
+                if p["id"] == current_id:
+                    target_index = i
+                    break
+        if target_index is None and self._filtered_projects:
+            target_index = 0
+        if target_index is not None:
+            self.projects_list.selection_set(target_index)
+            self.projects_list.see(target_index)
+            self._on_project_selected(None)
+        else:
+            self._reload_actions_for_current_project()
+
+    def _refresh_projects_view_only(self):
+        self.projects_list.delete(0, tk.END)
+        for p in self._filtered_projects:
+            self.projects_list.insert(tk.END, p["name"])
+
+    def _load_projects(self):
+        self._projects_cache = list_projects()
+        if not hasattr(self, "_filtered_projects"):
+            self._filtered_projects = list(self._projects_cache)
+        self._apply_project_filter()
+
+    def _get_selected_project(self):
+        idxs = self.projects_list.curselection()
+        if not idxs:
+            return None
+        return self._filtered_projects[idxs[0]]
+
+    def _on_project_selected(self, event):
+        self._reload_actions_for_current_project()
+
+    def _reload_actions_for_current_project(self):
+        p = self._get_selected_project()
+        self.actions_tree.delete(*self.actions_tree.get_children())
+        if not p:
+            return
+        actions = list_actions(p["id"])
+        for a in actions:
+            tag_names = [t["name"] for t in get_action_tags(a["id"])]
+            estado = "Completada" if a["is_complete"] else "Pendiente"
+            self.actions_tree.insert("", tk.END, values=(a["id"], a["description"], ", ".join(tag_names), estado, a["created_at"]))
 
     def _refresh_filter_tags(self):
         selected_names = [self.filter_tags_list.get(i) for i in self.filter_tags_list.curselection()]
@@ -777,10 +843,17 @@ class App(tk.Tk):
 
     def _focus_project_and_action(self, project_id, action_id):
         target_index = None
-        for idx, p in enumerate(self._projects_cache):
+        for idx, p in enumerate(getattr(self, "_filtered_projects", [])):
             if p["id"] == project_id:
                 target_index = idx
                 break
+        if target_index is None:
+            self.project_search_var.set("")
+            for idx, p in enumerate(self._filtered_projects):
+                if p["id"] == project_id:
+                    target_index = idx
+                    break
+
         if target_index is not None:
             self.projects_list.selection_clear(0, tk.END)
             self.projects_list.selection_set(target_index)
@@ -791,35 +864,6 @@ class App(tk.Tk):
                     self.actions_tree.selection_set(iid)
                     self.actions_tree.see(iid)
                     break
-
-    def _load_projects(self):
-        self.projects_list.delete(0, tk.END)
-        self._projects_cache = list_projects()
-        for p in self._projects_cache:
-            self.projects_list.insert(tk.END, p["name"])
-        if self._projects_cache:
-            self.projects_list.selection_set(0)
-            self._on_project_selected(None)
-
-    def _get_selected_project(self):
-        idxs = self.projects_list.curselection()
-        if not idxs:
-            return None
-        return self._projects_cache[idxs[0]]
-
-    def _on_project_selected(self, event):
-        self._reload_actions_for_current_project()
-
-    def _reload_actions_for_current_project(self):
-        p = self._get_selected_project()
-        self.actions_tree.delete(*self.actions_tree.get_children())
-        if not p:
-            return
-        actions = list_actions(p["id"])
-        for a in actions:
-            tag_names = [t["name"] for t in get_action_tags(a["id"])]
-            estado = "Completada" if a["is_complete"] else "Pendiente"
-            self.actions_tree.insert("", tk.END, values=(a["id"], a["description"], ", ".join(tag_names), estado, a["created_at"]))
 
     # -------------------- Project CRUD -------------------- #
     def _add_project(self):
