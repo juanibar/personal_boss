@@ -1,12 +1,22 @@
 
 import sqlite3
 import os
+import sys
+import shutil
 import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 
 APP_TITLE = "Personal Boss"
-DB_PATH = os.path.join(os.path.expanduser("~"), ".personal_boss.db")
+
+def _get_base_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+BASE_DIR = _get_base_dir()
+DB_PATH = os.path.join(BASE_DIR, "personal_boss.db")
+LEGACY_DB_PATH = os.path.join(os.path.expanduser("~"), ".personal_boss.db")
 
 DEFAULT_TAGS = [
     "prioridad A",
@@ -15,16 +25,21 @@ DEFAULT_TAGS = [
     "prioridad D",
     "casa",
     "trabajo",
-    "mañana",
-    "tarde",
-    "noche",
 ]
 
-# ---------------------------- Persistence Layer ---------------------------- #
+# ---------------------------- DB Helpers ---------------------------- #
+
+def ensure_db_location():
+    if not os.path.exists(DB_PATH) and os.path.exists(LEGACY_DB_PATH):
+        try:
+            shutil.copy2(LEGACY_DB_PATH, DB_PATH)
+        except Exception as e:
+            print(f"Advertencia: no se pudo migrar la DB legacy: {e}")
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON;")
     return conn
 
 def init_db():
@@ -65,7 +80,6 @@ def init_db():
     """)
     conn.commit()
 
-    # Seed default tags
     for t in DEFAULT_TAGS:
         try:
             cur.execute("INSERT OR IGNORE INTO tags(name) VALUES (?)", (t,))
@@ -100,7 +114,6 @@ def update_project(project_id, new_name):
 def delete_project(project_id):
     conn = get_conn()
     cur = conn.cursor()
-    # Deleting the project will cascade to actions due to FK constraints (if set properly).
     cur.execute("DELETE FROM projects WHERE id=?", (project_id,))
     conn.commit()
     conn.close()
@@ -155,7 +168,6 @@ def update_action(action_id, description, tag_ids, is_complete=None):
     cur.execute("UPDATE actions SET description=? WHERE id=?", (description, action_id))
     if is_complete is not None:
         cur.execute("UPDATE actions SET is_complete=? WHERE id=?", (1 if is_complete else 0, action_id))
-    # Reset tags
     cur.execute("DELETE FROM action_tags WHERE action_id=?", (action_id,))
     for tid in tag_ids:
         cur.execute("INSERT OR IGNORE INTO action_tags(action_id, tag_id) VALUES (?, ?)", (action_id, tid))
@@ -215,7 +227,6 @@ def find_next_action_by_tags(selected_tag_ids):
     conn = get_conn()
     cur = conn.cursor()
     if not selected_tag_ids:
-        # Earliest incomplete across all projects
         cur.execute("""
             SELECT a.*, p.name AS project_name
             FROM actions a
@@ -246,35 +257,89 @@ def find_next_action_by_tags(selected_tag_ids):
     conn.close()
     return row
 
+def find_actions_by_tags(selected_tag_ids, include_completed=False):
+    """
+    Devuelve TODAS las acciones que cumplen TODAS las etiquetas seleccionadas,
+    en orden de creación ascendente. Por defecto solo pendientes.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    status_clause = "" if include_completed else "AND a.is_complete = 0"
+    if not selected_tag_ids:
+        query = f"""
+            SELECT a.*, p.name AS project_name,
+                   GROUP_CONCAT(t.name, ', ') AS tag_names
+            FROM actions a
+            JOIN projects p ON p.id = a.project_id
+            LEFT JOIN action_tags at ON at.action_id = a.id
+            LEFT JOIN tags t ON t.id = at.tag_id
+            WHERE 1=1 {status_clause}
+            GROUP BY a.id
+            ORDER BY a.created_at ASC
+        """
+        cur.execute(query)
+    else:
+        placeholders = ",".join("?" * len(selected_tag_ids))
+        query = f"""
+            SELECT a.*, p.name AS project_name,
+                   GROUP_CONCAT(t.name, ', ') AS tag_names
+            FROM actions a
+            JOIN projects p ON p.id = a.project_id
+            LEFT JOIN action_tags at ON at.action_id = a.id
+            LEFT JOIN tags t ON t.id = at.tag_id
+            WHERE 1=1 {status_clause}
+              AND a.id IN (
+                SELECT action_id
+                FROM action_tags
+                WHERE tag_id IN ({placeholders})
+                GROUP BY action_id
+                HAVING COUNT(DISTINCT tag_id) = {len(selected_tag_ids)}
+              )
+            GROUP BY a.id
+            ORDER BY a.created_at ASC
+        """
+        cur.execute(query, selected_tag_ids)
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
 # ---------------------------- UI Components ---------------------------- #
 
 class TagManager(tk.Toplevel):
     def __init__(self, master, on_close=None):
         super().__init__(master)
         self.title("Gestionar etiquetas")
-        self.geometry("420x380")
+        self.geometry("460x420")
         self.on_close = on_close
         self.configure(padx=10, pady=10)
 
+        # Search box
+        ttk.Label(self, text="Buscar etiqueta:").grid(row=0, column=0, sticky="w")
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(self, textvariable=self.search_var)
+        self.search_entry.grid(row=0, column=1, columnspan=2, sticky="ew")
+        self.grid_columnconfigure(1, weight=1)
+        self.search_var.trace_add("write", lambda *args: self._apply_filter())
+
+        # Tag list
         self.tag_list = tk.Listbox(self, height=12)
-        self.tag_list.grid(row=0, column=0, columnspan=3, sticky="nsew", pady=(0,10))
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(0, weight=1)
+        self.tag_list.grid(row=1, column=0, columnspan=3, sticky="nsew", pady=(6,10))
+        self.grid_rowconfigure(1, weight=1)
+        self.grid_columnconfigure(0, weight=0)
 
         self.refresh_tags()
 
-        ttk.Label(self, text="Nueva etiqueta:").grid(row=1, column=0, sticky="w")
+        ttk.Label(self, text="Nueva etiqueta:").grid(row=2, column=0, sticky="w")
         self.new_tag_entry = ttk.Entry(self)
-        self.new_tag_entry.grid(row=1, column=1, sticky="ew")
-        self.grid_columnconfigure(1, weight=1)
-        ttk.Button(self, text="Agregar", command=self.add_tag).grid(row=1, column=2, sticky="e")
+        self.new_tag_entry.grid(row=2, column=1, sticky="ew")
+        ttk.Button(self, text="Agregar", command=self.add_tag).grid(row=2, column=2, sticky="e")
 
-        ttk.Label(self, text="Renombrar seleccionada a:").grid(row=2, column=0, sticky="w", pady=(10,0))
+        ttk.Label(self, text="Renombrar seleccionada a:").grid(row=3, column=0, sticky="w", pady=(10,0))
         self.rename_entry = ttk.Entry(self)
-        self.rename_entry.grid(row=2, column=1, sticky="ew", pady=(10,0))
-        ttk.Button(self, text="Renombrar", command=self.rename_selected).grid(row=2, column=2, pady=(10,0))
+        self.rename_entry.grid(row=3, column=1, sticky="ew", pady=(10,0))
+        ttk.Button(self, text="Renombrar", command=self.rename_selected).grid(row=3, column=2, pady=(10,0))
 
-        ttk.Button(self, text="Eliminar seleccionada", command=self.delete_selected).grid(row=3, column=0, columnspan=3, pady=(12,0))
+        ttk.Button(self, text="Eliminar seleccionada", command=self.delete_selected).grid(row=4, column=0, columnspan=3, pady=(12,0))
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -284,9 +349,17 @@ class TagManager(tk.Toplevel):
         self.destroy()
 
     def refresh_tags(self):
+        self.all_tags = list_all_tags()
+        self._apply_filter()
+
+    def _apply_filter(self):
+        term = (self.search_var.get() or "").strip().lower()
+        if term:
+            self.filtered_tags = [t for t in self.all_tags if term in t["name"].lower()]
+        else:
+            self.filtered_tags = list(self.all_tags)
         self.tag_list.delete(0, tk.END)
-        self.tags = list_all_tags()
-        for t in self.tags:
+        for t in self.filtered_tags:
             self.tag_list.insert(tk.END, t["name"])
 
     def add_tag(self):
@@ -300,14 +373,14 @@ class TagManager(tk.Toplevel):
         except sqlite3.IntegrityError:
             messagebox.showerror("Error", f"La etiqueta '{name}' ya existe.")
 
-    def get_selected_tag(self):
+    def _get_selected_tag_row(self):
         idx = self.tag_list.curselection()
         if not idx:
             return None
-        return self.tags[idx[0]]
+        return self.filtered_tags[idx[0]]
 
     def rename_selected(self):
-        t = self.get_selected_tag()
+        t = self._get_selected_tag_row()
         if not t:
             messagebox.showinfo("Info", "Selecciona una etiqueta para renombrar.")
             return
@@ -323,7 +396,7 @@ class TagManager(tk.Toplevel):
             messagebox.showerror("Error", f"Ya existe una etiqueta con el nombre '{new_name}'.")
 
     def delete_selected(self):
-        t = self.get_selected_tag()
+        t = self._get_selected_tag_row()
         if not t:
             messagebox.showinfo("Info", "Selecciona una etiqueta para eliminar.")
             return
@@ -336,7 +409,7 @@ class ActionEditor(tk.Toplevel):
     def __init__(self, master, project_id, action=None, on_save=None, refresh_tags_cb=None):
         super().__init__(master)
         self.title("Acción")
-        self.geometry("520x420")
+        self.geometry("620x520")
         self.project_id = project_id
         self.action = action
         self.on_save = on_save
@@ -344,63 +417,92 @@ class ActionEditor(tk.Toplevel):
 
         self.configure(padx=10, pady=10)
         ttk.Label(self, text="Descripción:").grid(row=0, column=0, sticky="w")
-        self.desc_entry = ttk.Entry(self, width=55)
+        self.desc_entry = ttk.Entry(self, width=60)
         self.desc_entry.grid(row=0, column=1, columnspan=3, sticky="ew")
         self.grid_columnconfigure(1, weight=1)
 
-        # Tag add via dropdown (Combobox)
-        ttk.Label(self, text="Agregar etiqueta:").grid(row=1, column=0, sticky="w", pady=(10,0))
-        self.tag_values = [t["name"] for t in list_all_tags()]
-        self.tag_combo = ttk.Combobox(self, values=self.tag_values, state="readonly")
-        self.tag_combo.grid(row=1, column=1, sticky="ew", pady=(10,0))
-        ttk.Button(self, text="Añadir", command=self.add_selected_tag).grid(row=1, column=2, sticky="w", pady=(10,0))
-        ttk.Button(self, text="Nueva etiqueta…", command=self.create_new_tag).grid(row=1, column=3, sticky="w", pady=(10,0))
+        # Search + results for available tags
+        ttk.Label(self, text="Buscar etiqueta:").grid(row=1, column=0, sticky="w", pady=(10,0))
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(self, textvariable=self.search_var)
+        self.search_entry.grid(row=1, column=1, sticky="ew", pady=(10,0))
+        self.search_var.trace_add("write", lambda *args: self._refresh_results())
+
+        ttk.Button(self, text="Nueva etiqueta…", command=self.create_new_tag).grid(row=1, column=2, sticky="w", padx=(8,0), pady=(10,0))
+
+        ttk.Label(self, text="Etiquetas disponibles (doble clic para añadir):").grid(row=2, column=0, columnspan=2, sticky="w", pady=(8,0))
+        results_frame = ttk.Frame(self)
+        results_frame.grid(row=3, column=0, columnspan=3, sticky="nsew")
+        self.grid_rowconfigure(3, weight=1)
+        self.available_list = tk.Listbox(results_frame, height=10, selectmode=tk.BROWSE)
+        vscroll_av = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self.available_list.yview)
+        self.available_list.configure(yscrollcommand=vscroll_av.set)
+        self.available_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vscroll_av.pack(side=tk.RIGHT, fill=tk.Y)
+        self.available_list.bind("<Double-1>", lambda e: self.add_selected_from_results())
+        self.search_entry.bind("<Return>", lambda e: self.add_selected_from_results(first_only=True))
+
+        ttk.Button(self, text="Añadir seleccionada", command=self.add_selected_from_results).grid(row=4, column=0, sticky="w", pady=(6,0))
 
         # Selected tags list
-        ttk.Label(self, text="Etiquetas de la acción:").grid(row=2, column=0, sticky="w", pady=(10,0))
+        ttk.Label(self, text="Etiquetas de la acción:").grid(row=5, column=0, sticky="w", pady=(10,0))
         self.selected_tags_list = tk.Listbox(self, height=8, selectmode=tk.SINGLE)
-        self.selected_tags_list.grid(row=3, column=0, columnspan=3, sticky="nsew")
-        self.grid_rowconfigure(3, weight=1)
-        ttk.Button(self, text="Quitar etiqueta", command=self.remove_selected_tag).grid(row=3, column=3, sticky="n", padx=(8,0))
+        self.selected_tags_list.grid(row=6, column=0, columnspan=2, sticky="nsew")
+        self.grid_rowconfigure(6, weight=1)
+        ttk.Button(self, text="Quitar etiqueta", command=self.remove_selected_tag).grid(row=6, column=2, sticky="n", padx=(8,0))
 
-        # Status
         self.status_var = tk.BooleanVar(value=False)
         self.status_check = ttk.Checkbutton(self, text="Marcar como completada", variable=self.status_var)
-        self.status_check.grid(row=4, column=0, columnspan=2, sticky="w", pady=(10,0))
+        self.status_check.grid(row=7, column=0, columnspan=2, sticky="w", pady=(10,0))
 
-        # Buttons
         btn_frame = ttk.Frame(self)
-        btn_frame.grid(row=5, column=0, columnspan=4, sticky="e", pady=(12,0))
+        btn_frame.grid(row=8, column=0, columnspan=3, sticky="e", pady=(12,0))
         ttk.Button(btn_frame, text="Guardar", command=self.save).grid(row=0, column=0, padx=(0,6))
         ttk.Button(btn_frame, text="Cancelar", command=self.destroy).grid(row=0, column=1)
 
         self.selected_tag_ids = []
+        self._load_all_tags()
 
         if self.action:
             self.desc_entry.insert(0, self.action["description"])
             self.status_var.set(bool(self.action["is_complete"]))
-            # load current tags
             current = get_action_tags(self.action["id"])
             for t in current:
                 self.selected_tags_list.insert(tk.END, t["name"])
                 self.selected_tag_ids.append(t["id"])
+            self._refresh_results()
 
-    def add_selected_tag(self):
-        name = self.tag_combo.get().strip()
-        if not name:
+    def _load_all_tags(self):
+        self.all_tags = list_all_tags()
+        self._refresh_results()
+
+    def _refresh_results(self):
+        term = (self.search_var.get() or "").strip().lower()
+        available = [t for t in self.all_tags if t["id"] not in self.selected_tag_ids]
+        if term:
+            available = [t for t in available if term in t["name"].lower()]
+        self.filtered_available = available
+        self.available_list.delete(0, tk.END)
+        for t in self.filtered_available:
+            self.available_list.insert(tk.END, t["name"])
+
+    def add_selected_from_results(self, first_only=False):
+        idx = None
+        if first_only:
+            if self.filtered_available:
+                idx = 0
+        else:
+            sel = self.available_list.curselection()
+            if sel:
+                idx = sel[0]
+        if idx is None:
             return
-        # Find ID by name
-        tag = None
-        for t in list_all_tags():
-            if t["name"] == name:
-                tag = t
-                break
-        if not tag:
+        t = self.filtered_available[idx]
+        if t["id"] in self.selected_tag_ids:
             return
-        if tag["id"] in self.selected_tag_ids:
-            return
-        self.selected_tag_ids.append(tag["id"])
-        self.selected_tags_list.insert(tk.END, tag["name"])
+        self.selected_tag_ids.append(t["id"])
+        self.selected_tags_list.insert(tk.END, t["name"])
+        self._refresh_results()
 
     def create_new_tag(self):
         name = simpledialog.askstring("Nueva etiqueta", "Nombre de la etiqueta:", parent=self)
@@ -411,11 +513,10 @@ class ActionEditor(tk.Toplevel):
             return
         try:
             create_tag(name)
-            # refresh combobox and filter list in main app
-            self.tag_values = [t["name"] for t in list_all_tags()]
-            self.tag_combo["values"] = self.tag_values
             if self.refresh_tags_cb:
                 self.refresh_tags_cb()
+            self._load_all_tags()
+            self.search_var.set(name)
         except sqlite3.IntegrityError:
             messagebox.showerror("Error", f"Ya existe la etiqueta '{name}'.")
 
@@ -425,6 +526,7 @@ class ActionEditor(tk.Toplevel):
             return
         self.selected_tags_list.delete(idx[0])
         del self.selected_tag_ids[idx[0]]
+        self._refresh_results()
 
     def save(self):
         desc = self.desc_entry.get().strip()
@@ -456,7 +558,6 @@ class NextActionDialog(tk.Toplevel):
         ttk.Label(self, text="Etiquetas:", font=("TkDefaultFont", 10, "bold")).grid(row=2, column=0, sticky="w", pady=(6,0))
         ttk.Label(self, text=", ".join(tags_for_action)).grid(row=2, column=1, sticky="w", pady=(6,0))
 
-        # Buttons
         btnf = ttk.Frame(self)
         btnf.grid(row=3, column=0, columnspan=2, sticky="e", pady=(16,0))
         ttk.Button(btnf, text="Marcar como completada", command=lambda: (mark_done_cb(action_row["id"]), self._close())).grid(row=0, column=0, padx=(0,8))
@@ -467,39 +568,164 @@ class NextActionDialog(tk.Toplevel):
         self.destroy()
 
 
+class MatchingActionsDialog(tk.Toplevel):
+    def __init__(self, master, tag_ids, focus_project_cb, mark_done_cb):
+        super().__init__(master)
+        self.title("Acciones coincidentes (pendientes)")
+        self.geometry("900x420")
+        self.configure(padx=12, pady=12)
+        self.tag_ids = tag_ids
+        self.focus_project_cb = focus_project_cb
+        self.mark_done_cb = mark_done_cb
+
+        ttk.Label(self, text="Resultados", font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
+
+        cols = ("id", "proyecto", "descripcion", "tags", "creada")
+        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=14)
+        self.tree.heading("id", text="ID")
+        self.tree.heading("proyecto", text="Proyecto")
+        self.tree.heading("descripcion", text="Descripción")
+        self.tree.heading("tags", text="Etiquetas")
+        self.tree.heading("creada", text="Creada")
+        self.tree.column("id", width=50, anchor="center")
+        self.tree.column("proyecto", width=160)
+        self.tree.column("descripcion", width=320)
+        self.tree.column("tags", width=200)
+        self.tree.column("creada", width=150, anchor="center")
+        self.tree.pack(fill=tk.BOTH, expand=True, pady=(6,8))
+
+        btnf = ttk.Frame(self)
+        btnf.pack(fill=tk.X)
+        ttk.Button(btnf, text="Marcar como completada", command=self._mark_selected).pack(side=tk.LEFT)
+        ttk.Button(btnf, text="Ir al proyecto", command=self._goto_selected).pack(side=tk.LEFT, padx=(8,0))
+        ttk.Button(btnf, text="Cerrar", command=self.destroy).pack(side=tk.RIGHT)
+
+        self._load_results()
+
+    def _load_results(self):
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+        rows = find_actions_by_tags(self.tag_ids, include_completed=False)
+        if not rows:
+            messagebox.showinfo("Sin resultados", "No hay acciones pendientes que coincidan con las etiquetas seleccionadas.")
+            self.destroy()
+            return
+        for r in rows:
+            tag_names = r.get("tag_names") if isinstance(r, dict) else r["tag_names"]
+            self.tree.insert("", tk.END, values=(r["id"], r["project_name"], r["description"], tag_names or "", r["created_at"]))
+
+    def _get_selected_action_id(self):
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        vals = self.tree.item(sel[0], "values")
+        return int(vals[0])
+
+    def _mark_selected(self):
+        aid = self._get_selected_action_id()
+        if not aid:
+            messagebox.showinfo("Info", "Selecciona una acción en la lista.")
+            return
+        self.mark_done_cb(aid)  # actualiza en DB y en vista principal
+        self._load_results()    # refresca lista (la acción marcada desaparece)
+
+    def _goto_selected(self):
+        aid = self._get_selected_action_id()
+        if not aid:
+            messagebox.showinfo("Info", "Selecciona una acción en la lista.")
+            return
+        # Para obtener el project_id: consulta rápida
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT project_id FROM actions WHERE id=?", (aid,))
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            self.focus_project_cb(row["project_id"], aid)
+            self.destroy()
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1000x600")
-        self.minsize(920, 540)
+        self.geometry("1100x640")
+        self.minsize(980, 560)
 
-        # Layout: top filter bar, main split: left projects, right actions
-        self._build_topbar()
         self._build_main_area()
         self._load_projects()
         self._refresh_filter_tags()
 
-    # -------------------- Top Bar (Filter + Next Action) -------------------- #
-    def _build_topbar(self):
-        topbar = ttk.Frame(self, padding=(10, 10))
-        topbar.pack(side=tk.TOP, fill=tk.X)
+    def _build_main_area(self):
+        main = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
+        main.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(topbar, text="Filtrar por etiquetas (selección múltiple):").pack(side=tk.LEFT, padx=(0,10))
-        self.filter_tags_list = tk.Listbox(topbar, selectmode=tk.EXTENDED, height=4, exportselection=False)
-        self.filter_tags_list.pack(side=tk.LEFT, padx=(0,10), fill=tk.X, expand=True)
+        left = ttk.Frame(main, padding=(10,10))
+        main.add(left, weight=1)
 
-        ttk.Button(topbar, text="Siguiente acción", command=self._show_next_action).pack(side=tk.LEFT, padx=(6,6))
-        ttk.Button(topbar, text="Gestionar etiquetas…", command=self._open_tag_manager).pack(side=tk.LEFT)
+        ttk.Label(left, text="Proyectos").pack(anchor="w")
+        self.projects_list = tk.Listbox(left, height=12, exportselection=False)
+        self.projects_list.pack(fill=tk.BOTH, expand=True, pady=(4,6))
+        self.projects_list.bind("<<ListboxSelect>>", self._on_project_selected)
+
+        proj_btns = ttk.Frame(left)
+        proj_btns.pack(fill=tk.X, pady=(0,6))
+        ttk.Button(proj_btns, text="Agregar proyecto", command=self._add_project).pack(side=tk.LEFT)
+        ttk.Button(proj_btns, text="Renombrar", command=self._rename_project).pack(side=tk.LEFT, padx=(6,0))
+        ttk.Button(proj_btns, text="Eliminar", command=self._delete_project).pack(side=tk.LEFT, padx=(6,0))
+
+        center = ttk.Frame(main, padding=(10,10))
+        main.add(center, weight=3)
+
+        ttk.Label(center, text="Acciones del proyecto seleccionado").pack(anchor="w")
+        columns = ("id", "descripcion", "tags", "estado", "creada")
+        self.actions_tree = ttk.Treeview(center, columns=columns, show="headings", height=16)
+        self.actions_tree.heading("id", text="ID")
+        self.actions_tree.heading("descripcion", text="Descripción")
+        self.actions_tree.heading("tags", text="Etiquetas")
+        self.actions_tree.heading("estado", text="Estado")
+        self.actions_tree.heading("creada", text="Creada")
+        self.actions_tree.column("id", width=40, anchor="center")
+        self.actions_tree.column("descripcion", width=360)
+        self.actions_tree.column("tags", width=240)
+        self.actions_tree.column("estado", width=100, anchor="center")
+        self.actions_tree.column("creada", width=180, anchor="center")
+        self.actions_tree.pack(fill=tk.BOTH, expand=True, pady=(4,6))
+
+        self.actions_tree.bind("<Double-1>", self._edit_selected_action)
+
+        act_btns = ttk.Frame(center)
+        act_btns.pack(fill=tk.X)
+        ttk.Button(act_btns, text="Agregar acción", command=self._add_action).pack(side=tk.LEFT)
+        ttk.Button(act_btns, text="Editar", command=self._edit_selected_action).pack(side=tk.LEFT, padx=(6,0))
+        ttk.Button(act_btns, text="Alternar completa", command=self._toggle_selected_action).pack(side=tk.LEFT, padx=(6,0))
+        ttk.Button(act_btns, text="Eliminar", command=self._delete_selected_action).pack(side=tk.LEFT, padx=(6,0))
+
+        right = ttk.Frame(main, padding=(10,10))
+        main.add(right, weight=1)
+
+        ttk.Label(right, text="Filtrar por etiquetas").pack(anchor="w")
+
+        list_frame = ttk.Frame(right)
+        list_frame.pack(fill=tk.BOTH, expand=True, pady=(4,6))
+
+        self.filter_tags_list = tk.Listbox(list_frame, selectmode=tk.EXTENDED, exportselection=False)
+        vscroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.filter_tags_list.yview)
+        self.filter_tags_list.configure(yscrollcommand=vscroll.set)
+
+        self.filter_tags_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        ttk.Button(right, text="Siguiente acción", command=self._show_next_action).pack(fill=tk.X, pady=(6,4))
+        ttk.Button(right, text="Ver acciones coincidentes", command=self._show_matching_actions).pack(fill=tk.X, pady=(0,4))
+        ttk.Button(right, text="Gestionar etiquetas…", command=self._open_tag_manager).pack(fill=tk.X)
 
     def _refresh_filter_tags(self):
-        # preserve selection names
         selected_names = [self.filter_tags_list.get(i) for i in self.filter_tags_list.curselection()]
         self.filter_tags_list.delete(0, tk.END)
         self.all_tags = list_all_tags()
         for t in self.all_tags:
             self.filter_tags_list.insert(tk.END, t["name"])
-        # restore selection
         to_select = []
         for i, t in enumerate(self.all_tags):
             if t["name"] in selected_names:
@@ -520,7 +746,6 @@ class App(tk.Tk):
         if not row:
             messagebox.showinfo("Sin resultados", "No hay acciones pendientes que coincidan con las etiquetas seleccionadas.")
             return
-        # find tags for this action
         tags = [t["name"] for t in get_action_tags(row["id"])]
         NextActionDialog(
             self,
@@ -530,12 +755,20 @@ class App(tk.Tk):
             mark_done_cb=self._mark_action_done_and_refresh,
         )
 
+    def _show_matching_actions(self):
+        tag_ids = self._get_selected_filter_tag_ids()
+        MatchingActionsDialog(
+            self,
+            tag_ids,
+            focus_project_cb=self._focus_project_and_action,
+            mark_done_cb=self._mark_action_done_and_refresh
+        )
+
     def _open_tag_manager(self):
         TagManager(self, on_close=self._refresh_after_tag_manager)
 
     def _refresh_after_tag_manager(self):
         self._refresh_filter_tags()
-        # Also refresh action editors (via deferred; handled when opening)
         self._reload_actions_for_current_project()
 
     def _mark_action_done_and_refresh(self, action_id):
@@ -543,8 +776,6 @@ class App(tk.Tk):
         self._reload_actions_for_current_project()
 
     def _focus_project_and_action(self, project_id, action_id):
-        # select project in list and focus the action row if visible
-        # first, select project
         target_index = None
         for idx, p in enumerate(self._projects_cache):
             if p["id"] == project_id:
@@ -555,60 +786,11 @@ class App(tk.Tk):
             self.projects_list.selection_set(target_index)
             self.projects_list.see(target_index)
             self._on_project_selected(None)
-            # focus action
             for iid in self.actions_tree.get_children():
                 if self.actions_tree.set(iid, "id") == str(action_id):
                     self.actions_tree.selection_set(iid)
                     self.actions_tree.see(iid)
                     break
-
-    # -------------------- Main Area: Projects & Actions --------------------- #
-    def _build_main_area(self):
-        main = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
-        main.pack(fill=tk.BOTH, expand=True)
-
-        # Left: Projects
-        left = ttk.Frame(main, padding=(10,10))
-        main.add(left, weight=1)
-
-        ttk.Label(left, text="Proyectos").pack(anchor="w")
-        self.projects_list = tk.Listbox(left, height=12, exportselection=False)
-        self.projects_list.pack(fill=tk.BOTH, expand=True, pady=(4,6))
-        self.projects_list.bind("<<ListboxSelect>>", self._on_project_selected)
-
-        proj_btns = ttk.Frame(left)
-        proj_btns.pack(fill=tk.X, pady=(0,6))
-        ttk.Button(proj_btns, text="Agregar proyecto", command=self._add_project).pack(side=tk.LEFT)
-        ttk.Button(proj_btns, text="Renombrar", command=self._rename_project).pack(side=tk.LEFT, padx=(6,0))
-        ttk.Button(proj_btns, text="Eliminar", command=self._delete_project).pack(side=tk.LEFT, padx=(6,0))
-
-        # Right: Actions
-        right = ttk.Frame(main, padding=(10,10))
-        main.add(right, weight=3)
-
-        ttk.Label(right, text="Acciones del proyecto seleccionado").pack(anchor="w")
-        columns = ("id", "descripcion", "tags", "estado", "creada")
-        self.actions_tree = ttk.Treeview(right, columns=columns, show="headings", height=16)
-        self.actions_tree.heading("id", text="ID")
-        self.actions_tree.heading("descripcion", text="Descripción")
-        self.actions_tree.heading("tags", text="Etiquetas")
-        self.actions_tree.heading("estado", text="Estado")
-        self.actions_tree.heading("creada", text="Creada")
-        self.actions_tree.column("id", width=40, anchor="center")
-        self.actions_tree.column("descripcion", width=340)
-        self.actions_tree.column("tags", width=220)
-        self.actions_tree.column("estado", width=90, anchor="center")
-        self.actions_tree.column("creada", width=160, anchor="center")
-        self.actions_tree.pack(fill=tk.BOTH, expand=True, pady=(4,6))
-
-        self.actions_tree.bind("<Double-1>", self._edit_selected_action)
-
-        act_btns = ttk.Frame(right)
-        act_btns.pack(fill=tk.X)
-        ttk.Button(act_btns, text="Agregar acción", command=self._add_action).pack(side=tk.LEFT)
-        ttk.Button(act_btns, text="Editar", command=self._edit_selected_action).pack(side=tk.LEFT, padx=(6,0))
-        ttk.Button(act_btns, text="Alternar completa", command=self._toggle_selected_action).pack(side=tk.LEFT, padx=(6,0))
-        ttk.Button(act_btns, text="Eliminar", command=self._delete_selected_action).pack(side=tk.LEFT, padx=(6,0))
 
     def _load_projects(self):
         self.projects_list.delete(0, tk.END)
@@ -702,7 +884,6 @@ class App(tk.Tk):
         if not aid:
             messagebox.showinfo("Info", "Selecciona una acción para editar.")
             return
-        # Load the action row
         conn = get_conn()
         cur = conn.cursor()
         cur.execute("SELECT * FROM actions WHERE id=?", (aid,))
@@ -731,6 +912,7 @@ class App(tk.Tk):
 
 
 def main():
+    ensure_db_location()
     init_db()
     app = App()
     app.mainloop()
